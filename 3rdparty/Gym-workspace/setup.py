@@ -47,57 +47,59 @@ CACHED_DEPENDENCIES = [
 
 if src_dir.exists():
     pyproject_toml_path = src_dir / "pyproject.toml"
-    with pyproject_toml_path.open("rb") as f:
-        pyproject_toml = tomllib.load(f)
     if not pyproject_toml_path.exists():
-        raise FileNotFoundError(
-            f"[Gym][setup] {pyproject_toml_path} not found; skipping dependency consistency check."
-        )
-
-    packages = pyproject_toml["tool"]["setuptools"]["packages"]["find"]["include"]
-
-    for package in packages:
-        final_packages.append(package)
-        final_package_dir[package] = src_dir / package
-
-    actual_dependencies = pyproject_toml["project"]["dependencies"]
-
-    ########################################
-    # Compare cached dependencies with the submodule's pyproject
-    ########################################
-
-    missing_in_cached = set(actual_dependencies) - set(CACHED_DEPENDENCIES)
-    extra_in_cached = set(CACHED_DEPENDENCIES) - set(actual_dependencies)
-
-    if missing_in_cached or extra_in_cached:
         print(
-            "[Gym][setup] Dependency mismatch between Gym-workspace/Gym/pyproject.toml vs Gym-workspace/setup.py::CACHED_DEPENDENCIES.",
+            f"[Gym][setup] {pyproject_toml_path} not found; skipping dependency consistency check.",
             file=sys.stderr,
         )
-        if missing_in_cached:
-            print(
-                "  - Present in Gym-workspace/Gym/pyproject.toml but missing from CACHED_DEPENDENCIES:",
-                file=sys.stderr,
-            )
-            for dep in sorted(missing_in_cached):
-                print(f"    * {dep}", file=sys.stderr)
-        if extra_in_cached:
-            print(
-                "  - Present in CACHED_DEPENDENCIES but not in Gym-workspace/Gym/pyproject.toml:",
-                file=sys.stderr,
-            )
-            for dep in sorted(extra_in_cached):
-                print(f"    * {dep}", file=sys.stderr)
-        print(
-            "  Please update CACHED_DEPENDENCIES or the submodule pyproject to keep them in sync.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
     else:
-        print(
-            "[Gym][setup] Dependency sets are consistent with the submodule pyproject.",
-            file=sys.stderr,
-        )
+        with pyproject_toml_path.open("rb") as f:
+            pyproject_toml = tomllib.load(f)
+
+        packages = pyproject_toml["tool"]["setuptools"]["packages"]["find"]["include"]
+
+        for package in packages:
+            final_packages.append(package)
+            final_package_dir[package] = src_dir / package
+
+        actual_dependencies = pyproject_toml["project"]["dependencies"]
+
+        ########################################
+        # Compare cached dependencies with the submodule's pyproject
+        ########################################
+
+        missing_in_cached = set(actual_dependencies) - set(CACHED_DEPENDENCIES)
+        extra_in_cached = set(CACHED_DEPENDENCIES) - set(actual_dependencies)
+
+        if missing_in_cached or extra_in_cached:
+            print(
+                "[Gym][setup] Dependency mismatch between Gym-workspace/Gym/pyproject.toml vs Gym-workspace/setup.py::CACHED_DEPENDENCIES.",
+                file=sys.stderr,
+            )
+            if missing_in_cached:
+                print(
+                    "  - Present in Gym-workspace/Gym/pyproject.toml but missing from CACHED_DEPENDENCIES:",
+                    file=sys.stderr,
+                )
+                for dep in sorted(missing_in_cached):
+                    print(f"    * {dep}", file=sys.stderr)
+            if extra_in_cached:
+                print(
+                    "  - Present in CACHED_DEPENDENCIES but not in Gym-workspace/Gym/pyproject.toml:",
+                    file=sys.stderr,
+                )
+                for dep in sorted(extra_in_cached):
+                    print(f"    * {dep}", file=sys.stderr)
+            print(
+                "  Please update CACHED_DEPENDENCIES or the submodule pyproject to keep them in sync.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        else:
+            print(
+                "[Gym][setup] Dependency sets are consistent with the submodule pyproject.",
+                file=sys.stderr,
+            )
 
 
 setuptools.setup(
