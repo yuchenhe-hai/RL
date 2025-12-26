@@ -26,6 +26,11 @@ from nemo_rl.algorithms.trainer_sampler_mock import (
     create_mock_sampler,
     mock_run_multi_turn_rollout,
 )
+from nemo_rl.algorithms.trainer_sampler_tinker import (
+    create_tinker_trainer,
+    create_tinker_sampler,
+    tinker_run_multi_turn_rollout,
+)
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -347,28 +352,319 @@ def run_grpo_local_mock(
     print("=" * 60)
 
 
+def run_grpo_local_tinker(
+    base_url: Optional[str] = None,
+    model_name: str = "meta-llama/Llama-3.1-8B",
+    lora_rank: int = 32,
+    master_config: Optional[MasterConfig] = None,
+    max_steps: Optional[int] = 2,
+    max_epochs: Optional[int] = 1,
+    vocab_size: int = 1000,
+    num_samples: int = 10,
+    resume_state_path: Optional[str] = None,
+) -> None:
+    """Run GRPO training locally using Tinker SDK implementations.
+
+    This function sets up a minimal GRPO configuration and uses Tinker SDK
+    (TrainingClient and SamplingClient) to run the refactored training loop.
+
+    Args:
+        base_url: Base URL for Tinker service (None for default)
+        model_name: Model name/identifier (e.g., "meta-llama/Llama-3.1-8B")
+        lora_rank: LoRA rank for training
+        master_config: Optional MasterConfig to override default config.
+        max_steps: Maximum number of training steps.
+        max_epochs: Maximum number of training epochs.
+        vocab_size: Vocabulary size for models and tokenizer.
+        num_samples: Number of samples in the dataset.
+        resume_state_path: Optional path to resume from checkpoint.
+    """
+    print("\n" + "=" * 60)
+    print(" " * 18 + "STARTING TINKER GRPO LOCAL RUN")
+    print("=" * 60 + "\n")
+
+    # Initialize Ray (will use local CPU resources)
+    print("▶ Initializing Ray for local execution...")
+    init_ray()
+    print("  ✓ Ray initialized")
+
+    # Create minimal master config if not provided
+    if master_config is None:
+        print("\n▶ Creating minimal master config...")
+        master_config_dict = {
+            "policy": {
+                "model_name": "tinker_model",
+                "make_sequence_length_divisible_by": 1,
+                "train_global_batch_size": 4,
+                "train_micro_batch_size": 2,
+                "max_total_sequence_length": 2048,
+                "generation": {
+                    "backend": "tinker",
+                    "colocated": {"enabled": True},
+                },
+            },
+            "grpo": {
+                "num_prompts_per_step": 2,
+                "num_generations_per_prompt": 2,
+                "max_num_steps": max_steps,
+                "max_num_epochs": max_epochs,
+                "max_rollout_turns": 1,
+                "normalize_rewards": False,
+                "use_leave_one_out_baseline": False,
+                "use_dynamic_sampling": False,
+                "val_period": 0,
+                "val_at_start": False,
+                "val_batch_size": 4,
+                "max_val_samples": 10,
+                "seed": 42,
+                "reward_scaling": {"enabled": False},
+                "reward_shaping": {"enabled": False},
+            },
+            "loss_fn": {
+                "clip_ratio": 0.2,
+                "use_importance_sampling_correction": False,
+            },
+            "logger": {
+                "log_dir": "./tinker_logs",
+                "wandb_enabled": False,
+            },
+            "checkpointing": {
+                "enabled": False,
+                "checkpoint_must_save_by": None,
+                "save_period": 1000,
+            },
+            "cluster": {
+                "num_nodes": 1,
+                "gpus_per_node": 1,
+            },
+        }
+        master_config = MasterConfig(master_config_dict)  # type: ignore
+        print("  ✓ Minimal config created")
+
+    # Create Tinker trainer
+    print("\n▶ Creating Tinker trainer...")
+    trainer = create_tinker_trainer(
+        base_url=base_url,
+        model_name=model_name,
+        lora_rank=lora_rank,
+        vocab_size=vocab_size,
+        colocated_inference=True,
+        resume_state_path=resume_state_path,
+    )
+    print("  ✓ Tinker trainer created")
+
+    # Create Tinker sampler
+    print("\n▶ Creating Tinker sampler...")
+    sampler = create_tinker_sampler(
+        base_url=base_url,
+        trainer=trainer,
+        vocab_size=vocab_size,
+    )
+    print("  ✓ Tinker sampler created")
+
+    # Create mock tokenizer (Tinker API may handle tokenization, but we need one for data prep)
+    print("\n▶ Creating tokenizer...")
+    tokenizer = MockTokenizer(vocab_size=vocab_size)
+    print("  ✓ Tokenizer created")
+
+    # Create mock loss function (Tinker API handles actual loss computation)
+    print("\n▶ Creating loss function...")
+    loss_fn = MockLossFn()
+    print("  ✓ Loss function created")
+
+    # Create logger
+    print("\n▶ Creating logger...")
+    default_logger_config = {
+        "log_dir": "./tinker_logs",
+        "wandb_enabled": False,
+        "swanlab_enabled": False,
+        "tensorboard_enabled": False,
+        "mlflow_enabled": False,
+        "wandb": {},
+        "monitor_gpus": False,
+        "gpu_monitoring": {
+            "collection_interval": 1.0,
+            "flush_interval": 10.0,
+        },
+    }
+    logger_config = master_config.get("logger", default_logger_config)
+    # Ensure all required keys are present
+    for key, value in default_logger_config.items():
+        if key not in logger_config:
+            logger_config[key] = value
+    logger = Logger(logger_config)
+    print("  ✓ Logger created")
+
+    # Create checkpointer
+    print("\n▶ Creating checkpointer...")
+    default_checkpointing_config = {
+        "enabled": False,
+        "checkpoint_dir": "./tinker_checkpoints",
+        "metric_name": None,
+        "higher_is_better": True,
+        "save_period": 1000,
+        "keep_top_k": 5,
+        "checkpoint_must_save_by": None,
+        "model_save_format": "safetensors",
+        "save_consolidated": False,
+        "model_cache_dir": "",
+        "model_repo_id": "",
+        "is_peft": False,
+        "peft_config": None,
+    }
+    checkpointing_config = master_config.get("checkpointing", default_checkpointing_config)
+    # Ensure all required keys are present
+    for key, value in default_checkpointing_config.items():
+        if key not in checkpointing_config:
+            checkpointing_config[key] = value
+    checkpointer = CheckpointManager(checkpointing_config)
+    print("  ✓ Checkpointer created")
+
+    # Create initial save state
+    grpo_save_state = _default_grpo_save_state()
+
+    # Create mock dataset and dataloader
+    print("\n▶ Creating dataset and dataloader...")
+    dataset = create_mock_dataset(num_samples=num_samples, vocab_size=vocab_size)
+    dataloader = StatefulDataLoader(
+        dataset,
+        batch_size=master_config["grpo"]["num_prompts_per_step"],
+        shuffle=False,
+        collate_fn=rl_collate_fn,
+        drop_last=True,
+        num_workers=0,
+    )
+    val_dataloader = StatefulDataLoader(
+        dataset,
+        batch_size=master_config["grpo"]["val_batch_size"],
+        shuffle=False,
+        collate_fn=rl_collate_fn,
+        drop_last=True,
+        num_workers=0,
+    )
+    print("  ✓ Dataset and dataloader created")
+
+    # Mock task_to_env (empty for Tinker - environment interactions may be via API)
+    task_to_env: dict[str, EnvironmentInterface] = {}
+    val_task_to_env: dict[str, EnvironmentInterface] = {}
+
+    print("\n▶ Starting GRPO training with Tinker API implementations...")
+    print("=" * 60)
+
+    # Monkey-patch run_multi_turn_rollout to use Tinker version
+    import nemo_rl.algorithms.grpo_refactored as grpo_refactored_module
+
+    original_rollout = grpo_refactored_module.run_multi_turn_rollout
+    grpo_refactored_module.run_multi_turn_rollout = tinker_run_multi_turn_rollout
+
+    try:
+        # Run training using the refactored function
+        grpo_train_refactored(
+            trainer=trainer,
+            sampler=sampler,
+            dataloader=dataloader,
+            val_dataloader=None,
+            tokenizer=tokenizer,
+            loss_fn=loss_fn,
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=logger,
+            checkpointer=checkpointer,
+            grpo_save_state=grpo_save_state,
+            master_config=master_config,
+            processor=None,
+        )
+    except KeyboardInterrupt:
+        print("\n⚠️  Training interrupted by user")
+    except Exception as e:
+        print(f"\n❌ Error during training: {e}")
+        import traceback
+
+        traceback.print_exc()
+    finally:
+        # Restore original function
+        grpo_refactored_module.run_multi_turn_rollout = original_rollout
+        print("\n▶ Cleaning up...")
+        print("  ✓ Cleanup complete")
+
+    print("\n" + "=" * 60)
+    print("  TINKER GRPO TRAINING COMPLETE")
+    print("=" * 60)
+
+
 def main():
-    """Main entry point for local mock testing."""
+    """Main entry point for local testing (mock or Tinker)."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run GRPO locally with mock implementations")
-    parser.add_argument("--num-samples", type=int, default=10, help="Number of mock samples")
+    parser = argparse.ArgumentParser(
+        description="Run GRPO locally with mock or Tinker API implementations"
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="mock",
+        choices=["mock", "tinker"],
+        help="Run mode: 'mock' for CPU-only mock, 'tinker' for Tinker API",
+    )
+    parser.add_argument("--num-samples", type=int, default=10, help="Number of samples")
     parser.add_argument("--max-steps", type=int, default=2, help="Maximum training steps")
     parser.add_argument("--max-epochs", type=int, default=1, help="Maximum epochs")
     parser.add_argument("--vocab-size", type=int, default=1000, help="Vocabulary size")
+    # Tinker-specific arguments
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help="Tinker service base URL (None for default)",
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="meta-llama/Llama-3.1-8B",
+        help="Model name/identifier",
+    )
+    parser.add_argument(
+        "--lora-rank",
+        type=int,
+        default=32,
+        help="LoRA rank for training",
+    )
+    parser.add_argument(
+        "--resume-state-path",
+        type=str,
+        default=None,
+        help="Path to resume from checkpoint",
+    )
     args = parser.parse_args()
 
-    run_grpo_local_mock(
-        num_samples=args.num_samples,
-        max_steps=args.max_steps,
-        max_epochs=args.max_epochs,
-        vocab_size=args.vocab_size,
-    )
+    if args.mode == "mock":
+        run_grpo_local_mock(
+            num_samples=args.num_samples,
+            max_steps=args.max_steps,
+            max_epochs=args.max_epochs,
+            vocab_size=args.vocab_size,
+        )
+    elif args.mode == "tinker":
+        run_grpo_local_tinker(
+            base_url=args.base_url,
+            model_name=args.model_name,
+            lora_rank=args.lora_rank,
+            num_samples=args.num_samples,
+            max_steps=args.max_steps,
+            max_epochs=args.max_epochs,
+            vocab_size=args.vocab_size,
+            resume_state_path=args.resume_state_path,
+        )
 
 
 if __name__ == "__main__":
     main()
 
+
 """ example usage: 
+# Mock mode:
 uv run nemo_rl/algorithms/grpo_local_runner.py --num-samples 10 --max-steps 2 --max-epochs 1 --vocab-size 1000
+
+# Tinker mode:
+uv run nemo_rl/algorithms/grpo_local_runner.py --mode tinker --model-name meta-llama/Llama-3.1-8B --lora-rank 32 --num-samples 10 --max-steps 2 --max-epochs 1 --vocab-size 1000
 """
