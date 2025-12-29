@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from pathlib import Path
 from typing import Any, Dict, List, TypedDict
 
@@ -53,8 +54,13 @@ class NemoGym(EnvironmentInterface):
         )
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
+        # Allow API key to be passed via config, or use dummy_key as fallback
+        # Note: If using OpenAI API, a valid API key must be provided
         initial_global_config_dict["policy_api_key"] = (
-            "dummy_key"  # No key necessary for training.
+            initial_global_config_dict.get("policy_api_key")
+            or self.cfg.get("policy_api_key")
+            or os.getenv("OPENAI_API_KEY")
+            or "dummy_key"  # Fallback for local/testing (may cause 401 if actually calling OpenAI)
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
