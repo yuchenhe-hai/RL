@@ -4,6 +4,17 @@
 
 This module provides utilities to run GRPO training locally for development/testing
 purposes using mock Trainer and Sampler implementations that work on CPU.
+
+The module supports two backends:
+- Mock: CPU-only implementations (MockTrainer, MockSampler) for testing
+- Tinker: Tinker SDK implementations (TinkerTrainer, TinkerSampler) for real training
+
+All implementations use the TrainerInterface and SamplerInterface, providing
+a unified API that matches the Tinker pattern:
+- trainer.forward_backward(data, loss_fn, datastream_id=None)
+- trainer.optim_step(optimizer_config=None)
+- trainer.save_weights_and_get_sampling_client()
+- sampler.sample(input_data, sampling_params, greedy=False)
 """
 import os
 from pathlib import Path
@@ -21,12 +32,20 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.grpo_refactored import grpo_train_refactored
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import ClippedPGLossFn, ClippedPGLossDataDict
+from nemo_rl.algorithms.trainer_sampler import (
+    TrainerInterface,
+    SamplerInterface,
+)
 from nemo_rl.algorithms.trainer_sampler_mock import (
+    MockTrainer,
+    MockSampler,
     create_mock_trainer,
     create_mock_sampler,
     mock_run_multi_turn_rollout,
 )
 from nemo_rl.algorithms.trainer_sampler_tinker import (
+    TinkerTrainer,
+    TinkerSampler,
     create_tinker_trainer,
     create_tinker_sampler,
     tinker_run_multi_turn_rollout,
@@ -234,18 +253,18 @@ def run_grpo_local_mock(
         master_config = MasterConfig(master_config_dict)  # type: ignore
         print("  ✓ Minimal config created")
 
-    # Create mock trainer
+    # Create mock trainer (returns MockTrainer implementing TrainerInterface)
     print("\n▶ Creating mock trainer...")
     trainer = create_mock_trainer(
         vocab_size=vocab_size,
         colocated_inference=True,
     )
-    print("  ✓ Mock trainer created")
+    print("  ✓ Mock trainer created (MockTrainer implementing TrainerInterface)")
 
-    # Create mock sampler
+    # Create mock sampler (returns MockSampler implementing SamplerInterface)
     print("\n▶ Creating mock sampler...")
     sampler = create_mock_sampler(trainer=trainer, vocab_size=vocab_size)
-    print("  ✓ Mock sampler created")
+    print("  ✓ Mock sampler created (MockSampler implementing SamplerInterface)")
 
     # Create mock loss function
     print("\n▶ Creating mock loss function...")
@@ -441,7 +460,7 @@ def run_grpo_local_tinker(
         master_config = MasterConfig(master_config_dict)  # type: ignore
         print("  ✓ Minimal config created")
 
-    # Create Tinker trainer
+    # Create Tinker trainer (returns TinkerTrainer implementing TrainerInterface)
     print("\n▶ Creating Tinker trainer...")
     trainer = create_tinker_trainer(
         base_url=base_url,
@@ -451,16 +470,16 @@ def run_grpo_local_tinker(
         colocated_inference=True,
         resume_state_path=resume_state_path,
     )
-    print("  ✓ Tinker trainer created")
+    print("  ✓ Tinker trainer created (TinkerTrainer implementing TrainerInterface)")
 
-    # Create Tinker sampler
+    # Create Tinker sampler (returns TinkerSampler implementing SamplerInterface)
     print("\n▶ Creating Tinker sampler...")
     sampler = create_tinker_sampler(
         base_url=base_url,
         trainer=trainer,
         vocab_size=vocab_size,
     )
-    print("  ✓ Tinker sampler created")
+    print("  ✓ Tinker sampler created (TinkerSampler implementing SamplerInterface)")
 
     # Create mock tokenizer (Tinker API may handle tokenization, but we need one for data prep)
     print("\n▶ Creating tokenizer...")

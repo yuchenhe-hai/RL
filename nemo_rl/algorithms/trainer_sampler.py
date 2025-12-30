@@ -16,7 +16,13 @@ Key Points for Compatibility with grpo.py:
     
     3. Weight updates work via trainer.weight_sync(sampler) which calls refit_policy_generation
        internally, using the same mechanism as grpo.py (IPC ZMQ for colocated, NCCL for non-colocated)
+
+Interface Design:
+    This module defines abstract interfaces (TrainerInterface, SamplerInterface) that match
+    the Tinker API pattern, allowing for unified usage across different backends (NeMo RL, Tinker, etc.).
+    The NeMoTrainer and NeMoSampler classes implement these interfaces for the NeMo RL backend.
 """
+from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional, TypedDict
 
 from nemo_rl.algorithms.interfaces import LossFunction
@@ -51,7 +57,108 @@ class OptimizerConfig(TypedDict):
     pass  # Can be extended with optimizer-specific config
 
 
-class Trainer:
+class TrainerInterface(ABC):
+    """Abstract interface for trainer implementations.
+    
+    This interface matches the Tinker API pattern, allowing unified usage across
+    different backends (NeMo RL, Tinker, etc.).
+    
+    Methods:
+        forward_backward: Perform forward and backward pass, computing gradients
+        optim_step: Perform optimizer step to update model parameters
+        save_weights_and_get_sampling_client: Sync weights and return a new sampler
+    """
+
+    @abstractmethod
+    def forward_backward(
+        self,
+        data: BatchedDataDict,
+        loss_fn: LossFunction,
+        datastream_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Perform forward and backward pass on the given data.
+        
+        Computes gradients but does not update model parameters.
+        Call optim_step() after this to update parameters.
+        
+        Args:
+            data: Training data batch
+            loss_fn: Loss function to use for training
+            datastream_id: Optional identifier for the data stream (for future use)
+        
+        Returns:
+            Dictionary containing training metrics (loss, grad_norm, etc.)
+        """
+        pass
+
+    @abstractmethod
+    def optim_step(
+        self,
+        optimizer_config: Optional[OptimizerConfig] = None,
+    ) -> None:
+        """Perform optimizer step to update model parameters.
+        
+        This should be called after forward_backward() to update model parameters
+        using the computed gradients.
+        
+        Args:
+            optimizer_config: Optional optimizer configuration
+        """
+        pass
+
+    @abstractmethod
+    def save_weights_and_get_sampling_client(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        timer: Optional[Any] = None,
+    ) -> "SamplerInterface":
+        """Save weights and return a new sampler with updated weights.
+        
+        This method syncs the current trainer weights and returns a new sampler
+        instance that uses the updated weights. This matches the Tinker pattern:
+        `sampling_client = await training_client.save_weights_and_get_sampling_client_async()`
+        
+        Args:
+            kv_scales: Optional dictionary of KV cache scales for FP8 quantization
+            timer: Optional timer for timing the weight sync operation
+        
+        Returns:
+            New SamplerInterface instance with updated weights
+        """
+        pass
+
+
+class SamplerInterface(ABC):
+    """Abstract interface for sampler implementations.
+    
+    This interface matches the Tinker API pattern, allowing unified usage across
+    different backends (NeMo RL, Tinker, etc.).
+    
+    Methods:
+        sample: Generate samples from the model
+    """
+
+    @abstractmethod
+    def sample(
+        self,
+        input_data: BatchedDataDict[GenerationDatumSpec],
+        sampling_params: Optional[dict[str, Any]] = None,
+        greedy: bool = False,
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Generate samples for the given input data.
+        
+        Args:
+            input_data: Input data containing prompts for generation
+            sampling_params: Optional sampling parameters (max_tokens, temperature, etc.)
+            greedy: Whether to use greedy decoding (True) or sampling (False)
+        
+        Returns:
+            Generated responses with output_ids, logprobs, etc.
+        """
+        pass
+
+
+class NeMoTrainer(TrainerInterface):
     """Wrapper around ColocatablePolicyInterface providing a clean training interface."""
 
     def __init__(
@@ -71,6 +178,7 @@ class Trainer:
                 None,
             ]
         ] = None,
+        generation: Optional[GenerationInterface] = None,
     ):
         """Initialize trainer with a policy.
 
@@ -79,10 +187,13 @@ class Trainer:
             colocated_inference: Whether inference is colocated with training
             refit_fn: Optional function for refitting/syncing weights to sampler.
                      If None, weight_sync will be a no-op.
+            generation: Optional generation interface for creating samplers.
+                       If None, will try to use policy if it implements GenerationInterface.
         """
         self._policy = policy
         self._colocated_inference = colocated_inference
         self._refit_fn = refit_fn
+        self._generation = generation
         self._pending_gradients = False  # Track if we have pending gradients from forward_backward
 
     @property
@@ -92,9 +203,9 @@ class Trainer:
 
     def forward_backward(
         self,
-        datastream_id: str,
+        data: BatchedDataDict,
         loss_fn: LossFunction,
-        data: Optional[BatchedDataDict] = None,
+        datastream_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Perform forward and backward pass on the given data.
 
@@ -107,27 +218,22 @@ class Trainer:
         Implementation Note:
             The current underlying policy.train() implementation performs both
             forward/backward AND optimization together in a single call. This method
-            wraps policy.train() to provide a cleaner interface. The optimize() method
+            wraps policy.train() to provide a cleaner interface. The optim_step() method
             is currently a no-op since optimization happens within this method.
             
             In the future, if the policy interface is extended to support true separation,
-            this method would only do forward/backward, and optimize() would handle
+            this method would only do forward/backward, and optim_step() would handle
             the optimizer step separately.
 
         Args:
-            datastream_id: Identifier for the data stream (for future use with streaming).
-                          Currently unused, but provided for API consistency.
+            data: Training data batch
             loss_fn: Loss function to use for training
-            data: Training data batch. If None, data should be fetched using datastream_id
+            datastream_id: Optional identifier for the data stream (for future use with streaming).
+                          Currently unused, but provided for API consistency.
 
         Returns:
             Dictionary containing training metrics (loss, grad_norm, etc.) from policy.train()
         """
-        if data is None:
-            raise ValueError(
-                "data must be provided. Future support for datastream_id-based data fetching not yet implemented."
-            )
-        
         # Prepare for training (set model to train mode, reload optimizer to GPU)
         self._policy.prepare_for_training()
         
@@ -136,7 +242,7 @@ class Trainer:
         # TODO: In future, if policy interface supports separation, we would:
         #   1. Call policy.forward_backward(data, loss_fn) to only compute gradients
         #   2. Set self._pending_gradients = True
-        #   3. Let optimize() handle the optimizer step
+        #   3. Let optim_step() handle the optimizer step
         train_results = self._policy.train(data, loss_fn)
         
         # In current implementation, optimizer step already happened in train()
@@ -144,7 +250,10 @@ class Trainer:
         
         return train_results
 
-    def optimize(self, optimizer_config: Optional[OptimizerConfig] = None) -> None:
+    def optim_step(
+        self,
+        optimizer_config: Optional[OptimizerConfig] = None,
+    ) -> None:
         """Perform optimizer step.
 
         This method should be called after forward_backward() to update model parameters.
@@ -168,13 +277,70 @@ class Trainer:
         #       self._policy.optimizer_step()
         #       self._pending_gradients = False
         #   else:
-        #       warnings.warn("optimize() called without pending gradients from forward_backward()")
+        #       warnings.warn("optim_step() called without pending gradients from forward_backward()")
         
         pass
 
+    def save_weights_and_get_sampling_client(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        timer: Optional[Any] = None,
+    ) -> "NeMoSampler":
+        """Save weights and return a new sampler with updated weights.
+        
+        This method syncs the current trainer weights to the sampler and returns
+        a new sampler instance. This matches the Tinker pattern:
+        `sampling_client = await training_client.save_weights_and_get_sampling_client_async()`
+        
+        Args:
+            kv_scales: Optional dictionary of KV cache scales for FP8 quantization
+            timer: Optional timer for timing the weight sync operation
+        
+        Returns:
+            New NeMoSampler instance with updated weights
+        
+        Raises:
+            RuntimeError: If weight synchronization fails (from refit_policy_generation)
+            ValueError: If generation interface is not available or refit_fn was not provided
+        """
+        # Get the generation interface
+        generation = self._generation
+        if generation is None:
+            # Try to use policy if it implements GenerationInterface
+            if isinstance(self._policy, GenerationInterface):
+                generation = self._policy  # type: ignore
+            else:
+                raise ValueError(
+                    "Cannot create sampler: generation interface not available. "
+                    "Either provide generation when creating trainer, or use a policy "
+                    "that implements GenerationInterface."
+                )
+        
+        # Create a new sampler linked to this trainer
+        sampler = NeMoSampler(generation=generation, trainer=self)
+        
+        # Sync weights to the sampler
+        if self._refit_fn is not None:
+            self._refit_fn(
+                self._policy,                    # policy: ColocatablePolicyInterface
+                generation,                      # policy_generation: GenerationInterface
+                self._colocated_inference,       # colocated_inference: bool
+                None,                            # _refit_buffer_size_gb: Optional[int] (use default)
+                timer,                           # timer: Optional[Timer]
+                kv_scales,                       # kv_scales: Optional[dict[str, float]]
+            )
+            sampler._stale = False
+        
+        return sampler
+
+    # Backward compatibility methods
+    def optimize(self, optimizer_config: Optional[OptimizerConfig] = None) -> None:
+        """Backward compatibility alias for optim_step()."""
+        return self.optim_step(optimizer_config)
+
     def weight_sync(
         self,
-        sampler: Optional["Sampler"] = None,
+        sampler: Optional["NeMoSampler"] = None,
         kv_scales: Optional[dict[str, float]] = None,
         timer: Optional[Any] = None,
     ) -> None:
@@ -220,13 +386,13 @@ class Trainer:
         )
 
 
-class Sampler:
+class NeMoSampler(SamplerInterface):
     """Wrapper around GenerationInterface providing a clean sampling interface."""
 
     def __init__(
         self,
         generation: GenerationInterface,
-        trainer: Optional[Trainer] = None,
+        trainer: Optional["NeMoTrainer"] = None,
     ):
         """Initialize sampler with a generation interface.
 
@@ -243,6 +409,39 @@ class Sampler:
         """Access to the underlying generation interface for advanced operations."""
         return self._generation
 
+    def sample(
+        self,
+        input_data: BatchedDataDict[GenerationDatumSpec],
+        sampling_params: Optional[dict[str, Any]] = None,
+        greedy: bool = False,
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Generate samples for the given input data.
+        
+        This method implements the SamplerInterface.sample() method, matching
+        the Tinker API pattern: `result = await sampling_client.sample_async(...)`
+
+        Args:
+            input_data: Input data containing prompts for generation
+            sampling_params: Optional sampling parameters (max_tokens, temperature, etc.)
+                           Currently unused, but provided for API consistency
+            greedy: Whether to use greedy decoding (True) or sampling (False)
+
+        Returns:
+            Generated responses with output_ids, logprobs, etc.
+        """
+        # Sync weights if needed
+        if self._stale and self._trainer is not None:
+            self.weight_sync()
+            self._stale = False
+
+        # Prepare for generation
+        self._generation.prepare_for_generation()
+        # Generate responses
+        output = self._generation.generate(input_data, greedy=greedy)
+        # Finish generation
+        self._generation.finish_generation()
+        return output
+
     def stream(
         self,
         input_data: BatchedDataDict[GenerationDatumSpec],
@@ -250,6 +449,8 @@ class Sampler:
         require_sync: bool = True,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Stream/generate responses for the given input data.
+        
+        Backward compatibility method. Use sample() for the interface-compliant API.
 
         Args:
             input_data: Input data containing prompts for generation
@@ -264,13 +465,8 @@ class Sampler:
             self.weight_sync()
             self._stale = False
 
-        # Prepare for generation
-        self._generation.prepare_for_generation()
-        # Generate responses
-        output = self._generation.generate(input_data, greedy=greedy)
-        # Finish generation
-        self._generation.finish_generation()
-        return output
+        # Use the sample() method
+        return self.sample(input_data, sampling_params=None, greedy=greedy)
 
     def weight_sync(
         self,
@@ -296,6 +492,11 @@ class Sampler:
         self._stale = True
 
 
+# Type aliases for backward compatibility
+Trainer = NeMoTrainer
+Sampler = NeMoSampler
+
+
 def create_trainer(
     checkpoint: Optional[str],
     trainer_config: TrainerConfig,
@@ -314,7 +515,8 @@ def create_trainer(
             None,
         ]
     ] = None,
-) -> Trainer:
+    generation: Optional[GenerationInterface] = None,
+) -> NeMoTrainer:
     """Factory function to create a trainer instance.
 
     This function wraps an already-initialized policy (created with Policy config
@@ -353,9 +555,12 @@ def create_trainer(
         refit_fn: Function for refitting/syncing weights to sampler.
                  MUST be provided (typically refit_policy_generation from grpo module)
                  for weight_sync() to work correctly. If None, weight_sync() will be a no-op.
+        generation: Optional generation interface for creating samplers via
+                   save_weights_and_get_sampling_client(). If None, will try to use
+                   policy if it implements GenerationInterface.
 
     Returns:
-        Trainer instance that can be used for training and weight synchronization
+        NeMoTrainer instance that can be used for training and weight synchronization
 
     Raises:
         ValueError: If policy is not properly initialized (will fail during usage)
@@ -375,15 +580,20 @@ def create_trainer(
             UserWarning,
         )
     
-    return Trainer(policy, colocated_inference=colocated_inference, refit_fn=refit_fn)
+    return NeMoTrainer(
+        policy,
+        colocated_inference=colocated_inference,
+        refit_fn=refit_fn,
+        generation=generation,
+    )
 
 
 def create_sampler(
     checkpoint: Optional[str],
     sampling_config: SamplingConfig,
     generation: Optional[GenerationInterface] = None,
-    trainer: Optional[Trainer] = None,
-) -> Sampler:
+    trainer: Optional[NeMoTrainer] = None,
+) -> NeMoSampler:
     """Factory function to create a sampler instance.
 
     Can create a standalone sampler or one linked to a trainer.
@@ -397,7 +607,7 @@ def create_sampler(
                 If provided, enables automatic weight synchronization.
 
     Returns:
-        Sampler instance
+        NeMoSampler instance
     """
     if generation is None:
         if trainer is not None:
@@ -416,7 +626,7 @@ def create_sampler(
 
     # Checkpoint loading is assumed to be done during generation initialization
     # This factory just wraps the generation in the Sampler interface
-    return Sampler(generation, trainer=trainer)
+    return NeMoSampler(generation, trainer=trainer)
 
 
 # ===============================================================================
@@ -476,30 +686,40 @@ def create_sampler(
 #         trainer=trainer,  # Will use trainer.policy as generation (must implement GenerationInterface)
 #     )
 #
-# # Usage in training loop:
-# # 1. Generate responses
+# # Usage in training loop (matching Tinker API pattern):
+# # 1. Generate responses using sampler.sample() (interface-compliant)
+# response = sampler.sample(input_data, sampling_params=None, greedy=False)
+# # Or use backward-compatible stream() method:
 # response = sampler.stream(input_data, greedy=False)
 #
-# # 2. Train on data (forward_backward wraps policy.train() which does forward,
-# #    backward, AND optimizer step in one call)
+# # 2. Forward-backward pass (interface-compliant)
 # train_results = trainer.forward_backward(
-#     datastream_id="batch_0",  # For future use with datastreams
-#     loss_fn=loss_fn,
 #     data=train_data,
+#     loss_fn=loss_fn,
+#     datastream_id="batch_0",  # Optional, for future use with datastreams
 # )
 # # Note: train_results contains metrics like 'loss', 'grad_norm', etc.
 #
-# # 3. Optimize (currently a no-op since optimization happens in forward_backward,
-# #    but included for API consistency and future compatibility)
+# # 3. Optimizer step (interface-compliant)
+# trainer.optim_step(optimizer_config=None)
+# # Note: Currently a no-op since optimization happens in forward_backward,
+# #       but included for API consistency and future compatibility
+# # Or use backward-compatible optimize() method:
 # trainer.optimize(optimizer_config=None)
 #
-# # 4. Sync weights when needed (e.g., after training step)
+# # 4. Sync weights and get new sampler (Tinker-style interface)
+# sampler = trainer.save_weights_and_get_sampling_client(
+#     kv_scales=kv_scales_cache,
+#     timer=timer,
+# )
+#
+# # Alternative: Traditional weight sync approach
 # sampler.mark_stale()  # Mark sampler as needing weight sync
 # trainer.weight_sync(sampler=sampler, kv_scales=kv_scales_cache, timer=timer)
 # # Or use sampler's weight_sync:
 # sampler.weight_sync(kv_scales=kv_scales_cache, timer=timer)
 #
-# # Alternative: If sampler is linked to trainer, it can auto-sync when streaming:
-# # sampler.stream(input_data, require_sync=True)  # Will sync if stale
+# # Alternative: If sampler is linked to trainer, it can auto-sync when sampling:
+# # sampler.sample(input_data)  # Will auto-sync if stale
 # ```
 

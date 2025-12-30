@@ -11,7 +11,11 @@ import torch
 from torch.nn import Linear
 
 from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.trainer_sampler import Sampler, Trainer
+from nemo_rl.algorithms.trainer_sampler import (
+    TrainerInterface,
+    SamplerInterface,
+    OptimizerConfig,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -250,36 +254,98 @@ class MockGeneration(GenerationInterface):
         return False
 
 
-def create_mock_trainer(
-    vocab_size: int = 1000,
-    hidden_size: int = 128,
-    colocated_inference: bool = False,
-) -> Trainer:
-    """Create a mock trainer for CPU testing.
+class MockTrainer(TrainerInterface):
+    """Mock trainer implementation that inherits from TrainerInterface."""
 
-    Args:
-        vocab_size: Vocabulary size for mock model
-        hidden_size: Hidden size for mock model
-        colocated_inference: Whether inference is colocated
-
-    Returns:
-        Trainer instance with mock policy
-    """
-    from nemo_rl.algorithms.trainer_sampler import Trainer, TrainerConfig
-
-    policy = MockPolicy(vocab_size=vocab_size, hidden_size=hidden_size)
-
-    # Create a mock refit function
-    def mock_refit_fn(
-        policy_interface,
-        generation_interface,
-        colocated,
-        buffer_size_gb=None,
-        timer=None,
-        kv_scales=None,
+    def __init__(
+        self,
+        policy: MockPolicy,
+        generation: Optional[MockGeneration] = None,
+        colocated_inference: bool = False,
     ):
-        """Mock refit function that simulates weight sync."""
-        print(f"  [MOCK] Refitting generation with policy weights (colocated={colocated})")
+        """Initialize mock trainer.
+
+        Args:
+            policy: Mock policy instance
+            generation: Optional mock generation instance for creating samplers
+            colocated_inference: Whether inference is colocated with training
+        """
+        self._policy = policy
+        self._generation = generation
+        self._colocated_inference = colocated_inference
+        self._pending_gradients = False
+
+    @property
+    def policy(self) -> MockPolicy:
+        """Access to the underlying policy."""
+        return self._policy
+
+    def forward_backward(
+        self,
+        data: BatchedDataDict,
+        loss_fn: LossFunction,
+        datastream_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Perform forward and backward pass on the given data.
+
+        Args:
+            data: Training data batch
+            loss_fn: Loss function to use for training
+            datastream_id: Optional identifier for the data stream (unused)
+
+        Returns:
+            Dictionary containing training metrics (loss, grad_norm, etc.)
+        """
+        # Prepare for training
+        self._policy.prepare_for_training()
+
+        # Call policy.train() which does forward, backward, and optimizer step
+        train_results = self._policy.train(data, loss_fn)
+
+        # In mock implementation, optimizer step already happened in train()
+        self._pending_gradients = False
+
+        return train_results
+
+    def optim_step(
+        self,
+        optimizer_config: Optional[OptimizerConfig] = None,
+    ) -> None:
+        """Perform optimizer step.
+
+        Currently a no-op since optimization happens in forward_backward().
+        Provided for API consistency.
+
+        Args:
+            optimizer_config: Optional optimizer configuration (unused)
+        """
+        # In mock implementation, optimizer step is done within policy.train()
+        # which is called in forward_backward(). This is a placeholder for future
+        # separation when policy interface supports it.
+        pass
+
+    def save_weights_and_get_sampling_client(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        timer: Optional[Any] = None,
+    ) -> "MockSampler":
+        """Save weights and return a new sampler with updated weights.
+
+        Args:
+            kv_scales: Optional dictionary of KV cache scales (unused in mock)
+            timer: Optional timer for timing the weight sync operation
+
+        Returns:
+            New MockSampler instance with updated weights
+        """
+        # Get or create generation
+        generation = self._generation
+        if generation is None:
+            generation = MockGeneration(vocab_size=self._policy.vocab_size)
+            self._generation = generation
+
+        # Sync weights (simulate weight transfer)
+        print(f"  [MOCK] Refitting generation with policy weights (colocated={self._colocated_inference})")
         if timer:
             with timer.time("mock_weight_sync"):
                 time.sleep(0.01)  # Simulate weight transfer time
@@ -287,31 +353,118 @@ def create_mock_trainer(
             time.sleep(0.01)
 
         # Update generation weights
-        if hasattr(generation_interface, "prepare_refit_info"):
-            policy_refit_info = policy_interface.prepare_refit_info()
-            generation_interface.prepare_refit_info(policy_refit_info)
+        if hasattr(generation, "prepare_refit_info"):
+            policy_refit_info = self._policy.prepare_refit_info()
+            generation.prepare_refit_info(policy_refit_info)
 
         # Simulate weight update
-        if colocated:
-            generation_interface.update_weights_via_ipc_zmq()
+        if self._colocated_inference:
+            generation.update_weights_via_ipc_zmq()
         else:
-            generation_interface.update_weights_from_collective()
+            generation.update_weights_from_collective()
 
         print("  [MOCK] Weight sync complete")
 
-    trainer = Trainer(
+        # Create and return new sampler
+        sampler = MockSampler(generation=generation, trainer=self)
+        return sampler
+
+
+class MockSampler(SamplerInterface):
+    """Mock sampler implementation that inherits from SamplerInterface."""
+
+    def __init__(
+        self,
+        generation: MockGeneration,
+        trainer: Optional[MockTrainer] = None,
+    ):
+        """Initialize mock sampler.
+
+        Args:
+            generation: Mock generation interface
+            trainer: Optional trainer reference for weight synchronization
+        """
+        self._generation = generation
+        self._trainer = trainer
+        self._stale = True  # Track if weights need sync
+
+    @property
+    def generation(self) -> MockGeneration:
+        """Access to the underlying generation interface."""
+        return self._generation
+
+    def sample(
+        self,
+        input_data: BatchedDataDict[GenerationDatumSpec],
+        sampling_params: Optional[dict[str, Any]] = None,
+        greedy: bool = False,
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Generate samples for the given input data.
+
+        Args:
+            input_data: Input data containing prompts for generation
+            sampling_params: Optional sampling parameters (unused in mock)
+            greedy: Whether to use greedy decoding (True) or sampling (False)
+
+        Returns:
+            Generated responses with output_ids, logprobs, etc.
+        """
+        # Sync weights if needed
+        if self._stale and self._trainer is not None:
+            # Update the trainer's generation reference to this sampler's generation
+            # so that weight sync updates the correct generation
+            self._trainer._generation = self._generation
+            # Sync weights (this will update the generation)
+            self._trainer.save_weights_and_get_sampling_client()
+            self._stale = False
+
+        # Prepare for generation
+        self._generation.prepare_for_generation()
+        # Generate responses
+        output = self._generation.generate(input_data, greedy=greedy)
+        # Finish generation
+        self._generation.finish_generation()
+        return output
+
+    def mark_stale(self) -> None:
+        """Mark sampler weights as stale (needing sync)."""
+        self._stale = True
+
+
+def create_mock_trainer(
+    vocab_size: int = 1000,
+    hidden_size: int = 128,
+    colocated_inference: bool = False,
+    generation: Optional[MockGeneration] = None,
+) -> MockTrainer:
+    """Create a mock trainer for CPU testing.
+
+    Args:
+        vocab_size: Vocabulary size for mock model
+        hidden_size: Hidden size for mock model
+        colocated_inference: Whether inference is colocated
+        generation: Optional MockGeneration instance for creating samplers via
+                 save_weights_and_get_sampling_client(). If None, will create
+                 one on demand when needed.
+
+    Returns:
+        MockTrainer instance with mock policy
+    """
+    policy = MockPolicy(vocab_size=vocab_size, hidden_size=hidden_size)
+
+    trainer = MockTrainer(
         policy=policy,
+        generation=generation,
         colocated_inference=colocated_inference,
-        refit_fn=mock_refit_fn,
     )
 
     return trainer
 
 
 def create_mock_sampler(
-    trainer: Optional[Trainer] = None,
+    trainer: Optional[MockTrainer] = None,
     vocab_size: int = 1000,
-) -> Sampler:
+) -> MockSampler:
     """Create a mock sampler for CPU testing.
 
     Args:
@@ -319,13 +472,11 @@ def create_mock_sampler(
         vocab_size: Vocabulary size for mock generation
 
     Returns:
-        Sampler instance with mock generation
+        MockSampler instance with mock generation
     """
-    from nemo_rl.algorithms.trainer_sampler import Sampler, SamplingConfig
-
     generation = MockGeneration(vocab_size=vocab_size)
 
-    sampler = Sampler(generation=generation, trainer=trainer)
+    sampler = MockSampler(generation=generation, trainer=trainer)
 
     return sampler
 

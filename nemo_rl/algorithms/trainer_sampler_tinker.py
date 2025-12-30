@@ -28,7 +28,11 @@ else:
     tinker_types = None
 
 from nemo_rl.algorithms.interfaces import LossFunction
-from nemo_rl.algorithms.trainer_sampler import Sampler, Trainer
+from nemo_rl.algorithms.trainer_sampler import (
+    TrainerInterface,
+    SamplerInterface,
+    OptimizerConfig,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -431,6 +435,192 @@ class TinkerGeneration(GenerationInterface):
         return False
 
 
+class TinkerTrainer(TrainerInterface):
+    """Tinker trainer implementation that inherits from TrainerInterface."""
+
+    def __init__(
+        self,
+        policy: TinkerPolicy,
+        generation: Optional[TinkerGeneration] = None,
+        colocated_inference: bool = False,
+        base_url: Optional[str] = None,
+    ):
+        """Initialize Tinker trainer.
+
+        Args:
+            policy: Tinker policy instance
+            generation: Optional Tinker generation instance for creating samplers
+            colocated_inference: Whether inference is colocated with training
+            base_url: Base URL for Tinker service (for creating new samplers)
+        """
+        self._policy = policy
+        self._generation = generation
+        self._colocated_inference = colocated_inference
+        self._base_url = base_url
+        self._pending_gradients = False
+
+    @property
+    def policy(self) -> TinkerPolicy:
+        """Access to the underlying policy."""
+        return self._policy
+
+    def forward_backward(
+        self,
+        data: BatchedDataDict,
+        loss_fn: LossFunction,
+        datastream_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Perform forward and backward pass on the given data.
+
+        Args:
+            data: Training data batch
+            loss_fn: Loss function to use for training
+            datastream_id: Optional identifier for the data stream (unused)
+
+        Returns:
+            Dictionary containing training metrics (loss, grad_norm, etc.)
+        """
+        # Prepare for training
+        self._policy.prepare_for_training()
+
+        # Call policy.train() which does forward, backward, and optimizer step
+        train_results = self._policy.train(data, loss_fn)
+
+        # In Tinker implementation, optimizer step already happened in train()
+        self._pending_gradients = False
+
+        return train_results
+
+    def optim_step(
+        self,
+        optimizer_config: Optional[OptimizerConfig] = None,
+    ) -> None:
+        """Perform optimizer step.
+
+        Currently a no-op since optimization happens in forward_backward().
+        Provided for API consistency.
+
+        Args:
+            optimizer_config: Optional optimizer configuration (unused)
+        """
+        # In Tinker implementation, optimizer step is done within policy.train()
+        # which is called in forward_backward(). This is a placeholder for future
+        # separation when policy interface supports it.
+        pass
+
+    def save_weights_and_get_sampling_client(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        timer: Optional[Any] = None,
+    ) -> "TinkerSampler":
+        """Save weights and return a new sampler with updated weights.
+
+        This matches the Tinker pattern:
+        `sampling_client = await training_client.save_weights_and_get_sampling_client_async()`
+
+        Args:
+            kv_scales: Optional dictionary of KV cache scales (unused in Tinker)
+            timer: Optional timer for timing the weight sync operation
+
+        Returns:
+            New TinkerSampler instance with updated weights
+        """
+        # Save weights for sampler
+        step = self._policy._current_step
+        weight_save_future = self._policy.training_client.save_weights_for_sampler(
+            name=f"{step:06d}"
+        )
+        model_path = weight_save_future.result().path
+
+        # Get or create generation
+        generation = self._generation
+        if generation is None:
+            # Create new generation from model path
+            generation = create_tinker_generation_from_model_path(
+                base_url=self._base_url,
+                model_path=model_path,
+                vocab_size=self._policy.vocab_size,
+            )
+        else:
+            # Update existing generation with new model path
+            service_client = tinker.ServiceClient(base_url=self._base_url)
+            new_sampling_client = service_client.create_sampling_client(model_path=model_path)
+            generation.sampling_client = new_sampling_client
+            generation.model_path = model_path
+            generation._stale = False
+
+        print(f"  [TINKER] Weight sync complete (model_path: {model_path})")
+
+        # Create and return new sampler
+        sampler = TinkerSampler(generation=generation, trainer=self)
+        return sampler
+
+
+class TinkerSampler(SamplerInterface):
+    """Tinker sampler implementation that inherits from SamplerInterface."""
+
+    def __init__(
+        self,
+        generation: TinkerGeneration,
+        trainer: Optional[TinkerTrainer] = None,
+    ):
+        """Initialize Tinker sampler.
+
+        Args:
+            generation: Tinker generation interface
+            trainer: Optional trainer reference for weight synchronization
+        """
+        self._generation = generation
+        self._trainer = trainer
+        self._stale = True  # Track if weights need sync
+
+    @property
+    def generation(self) -> TinkerGeneration:
+        """Access to the underlying generation interface."""
+        return self._generation
+
+    def sample(
+        self,
+        input_data: BatchedDataDict[GenerationDatumSpec],
+        sampling_params: Optional[dict[str, Any]] = None,
+        greedy: bool = False,
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Generate samples for the given input data.
+
+        This matches the Tinker pattern:
+        `result = await sampling_client.sample_async(...)`
+
+        Args:
+            input_data: Input data containing prompts for generation
+            sampling_params: Optional sampling parameters (max_tokens, temperature, etc.)
+                           Currently unused, but provided for API consistency
+            greedy: Whether to use greedy decoding (True) or sampling (False)
+
+        Returns:
+            Generated responses with output_ids, logprobs, etc.
+        """
+        # Sync weights if needed
+        if self._stale and self._trainer is not None:
+            # Update the trainer's generation reference to this sampler's generation
+            # so that weight sync updates the correct generation
+            self._trainer._generation = self._generation
+            # Sync weights (this will update the generation)
+            self._trainer.save_weights_and_get_sampling_client()
+            self._stale = False
+
+        # Prepare for generation
+        self._generation.prepare_for_generation()
+        # Generate responses
+        output = self._generation.generate(input_data, greedy=greedy)
+        # Finish generation
+        self._generation.finish_generation()
+        return output
+
+    def mark_stale(self) -> None:
+        """Mark sampler weights as stale (needing sync)."""
+        self._stale = True
+
+
 def create_tinker_trainer(
     base_url: Optional[str] = None,
     model_name: str = "meta-llama/Llama-3.1-8B",
@@ -438,7 +628,8 @@ def create_tinker_trainer(
     vocab_size: int = 1000,
     colocated_inference: bool = False,
     resume_state_path: Optional[str] = None,
-) -> Trainer:
+    generation: Optional[TinkerGeneration] = None,
+) -> TinkerTrainer:
     """Create a trainer that uses Tinker TrainingClient.
 
     Args:
@@ -448,9 +639,12 @@ def create_tinker_trainer(
         vocab_size: Vocabulary size
         colocated_inference: Whether inference is colocated with training
         resume_state_path: Optional path to resume from checkpoint
+        generation: Optional TinkerGeneration instance for creating samplers via
+                   save_weights_and_get_sampling_client(). If None, will create
+                   one on demand when needed.
 
     Returns:
-        Trainer instance using Tinker APIs
+        TinkerTrainer instance using Tinker APIs
     """
     if not TINKER_AVAILABLE:
         raise ImportError("Tinker SDK is not available. Please install tinker package.")
@@ -475,84 +669,36 @@ def create_tinker_trainer(
         vocab_size=vocab_size,
     )
     
-    # Create refit function that uses Tinker's save_weights_for_sampler
-    # Capture base_url in closure
-    refit_base_url = base_url
-    
-    def tinker_refit_fn(
-        policy_interface,
-        generation_interface,
-        colocated,
-        buffer_size_gb=None,
-        timer=None,
-        kv_scales=None,
-    ):
-        """Refit function that uses Tinker's save_weights_for_sampler."""
-        print(f"  [TINKER] Refitting generation with policy weights (colocated={colocated})")
-        
-        if isinstance(policy_interface, TinkerPolicy):
-            # Save weights for sampler
-            step = policy_interface._current_step
-            weight_save_future = policy_interface.training_client.save_weights_for_sampler(
-                name=f"{step:06d}"
-            )
-            model_path = weight_save_future.result().path
-            
-            # Update generation interface with new model path
-            if isinstance(generation_interface, TinkerGeneration):
-                # Create new sampling client with updated model path
-                service_client = tinker.ServiceClient(base_url=refit_base_url)
-                new_sampling_client = service_client.create_sampling_client(model_path=model_path)
-                generation_interface.sampling_client = new_sampling_client
-                generation_interface.model_path = model_path
-                generation_interface._stale = False
-                print(f"  [TINKER] Weight sync complete (model_path: {model_path})")
-        else:
-            print("  [TINKER] Warning: Non-Tinker policy interface, skipping weight sync")
-    
-    trainer = Trainer(
+    trainer = TinkerTrainer(
         policy=policy,
+        generation=generation,
         colocated_inference=colocated_inference,
-        refit_fn=tinker_refit_fn,
+        base_url=base_url,
     )
     
     return trainer
 
 
-def create_tinker_sampler(
-    base_url: Optional[str] = None,
-    model_path: Optional[str] = None,
-    trainer: Optional[Trainer] = None,
+def create_tinker_generation_from_model_path(
+    base_url: Optional[str],
+    model_path: str,
     vocab_size: int = 1000,
-) -> Sampler:
-    """Create a sampler that uses Tinker SamplingClient.
-
+) -> TinkerGeneration:
+    """Create a TinkerGeneration instance from a model path.
+    
+    This is a helper function for creating TinkerGeneration instances,
+    useful when implementing save_weights_and_get_sampling_client().
+    
     Args:
         base_url: Base URL for Tinker service (None for default)
-        model_path: Path to model weights (if None, will get from trainer)
-        trainer: Optional trainer to link for weight sync
+        model_path: Path to model weights
         vocab_size: Vocabulary size
-
+    
     Returns:
-        Sampler instance using Tinker APIs
+        TinkerGeneration instance
     """
     if not TINKER_AVAILABLE:
         raise ImportError("Tinker SDK is not available. Please install tinker package.")
-    
-    # Get model_path from trainer if not provided
-    if model_path is None and trainer is not None:
-        if isinstance(trainer.policy, TinkerPolicy):
-            # Get initial model path by saving weights
-            step = trainer.policy._current_step
-            weight_save_future = trainer.policy.training_client.save_weights_for_sampler(
-                name=f"{step:06d}_init"
-            )
-            model_path = weight_save_future.result().path
-        else:
-            raise ValueError("Trainer must have TinkerPolicy to get model_path")
-    
-    if model_path is None:
-        raise ValueError("model_path must be provided or trainer must have TinkerPolicy")
     
     # Create service client
     service_client = tinker.ServiceClient(base_url=base_url)
@@ -567,7 +713,49 @@ def create_tinker_sampler(
         vocab_size=vocab_size,
     )
     
-    sampler = Sampler(generation=generation, trainer=trainer)
+    return generation
+
+
+def create_tinker_sampler(
+    base_url: Optional[str] = None,
+    model_path: Optional[str] = None,
+    trainer: Optional[TinkerTrainer] = None,
+    vocab_size: int = 1000,
+) -> TinkerSampler:
+    """Create a sampler that uses Tinker SamplingClient.
+
+    Args:
+        base_url: Base URL for Tinker service (None for default)
+        model_path: Path to model weights (if None, will get from trainer)
+        trainer: Optional trainer to link for weight sync
+        vocab_size: Vocabulary size
+
+    Returns:
+        TinkerSampler instance using Tinker APIs
+    """
+    if not TINKER_AVAILABLE:
+        raise ImportError("Tinker SDK is not available. Please install tinker package.")
+    
+    # Get model_path from trainer if not provided
+    if model_path is None and trainer is not None:
+        # Get initial model path by saving weights
+        step = trainer.policy._current_step
+        weight_save_future = trainer.policy.training_client.save_weights_for_sampler(
+            name=f"{step:06d}_init"
+        )
+        model_path = weight_save_future.result().path
+    
+    if model_path is None:
+        raise ValueError("model_path must be provided or trainer must have TinkerPolicy")
+    
+    # Create generation using helper function
+    generation = create_tinker_generation_from_model_path(
+        base_url=base_url,
+        model_path=model_path,
+        vocab_size=vocab_size,
+    )
+    
+    sampler = TinkerSampler(generation=generation, trainer=trainer)
     
     return sampler
 

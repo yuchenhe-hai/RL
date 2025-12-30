@@ -2,7 +2,16 @@
 """Refactored GRPO training using the new Trainer and Sampler interfaces.
 
 This module provides a cleaner implementation of GRPO using the abstraction layer
-defined in trainer_sampler.py.
+defined in trainer_sampler.py. It uses the TrainerInterface and SamplerInterface
+which provide a unified API matching the Tinker pattern:
+
+- trainer.forward_backward(data, loss_fn, datastream_id=None)
+- trainer.optim_step(optimizer_config=None)
+- trainer.save_weights_and_get_sampling_client()
+- sampler.sample(input_data, sampling_params, greedy=False)
+
+All implementations (NeMoTrainer, MockTrainer, TinkerTrainer, etc.) implement
+these interfaces, allowing the same training loop to work with different backends.
 """
 import os
 from typing import Optional
@@ -22,7 +31,14 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import ClippedPGLossDataDict
-from nemo_rl.algorithms.trainer_sampler import Sampler, Trainer
+from nemo_rl.algorithms.trainer_sampler import (
+    TrainerInterface,
+    SamplerInterface,
+    NeMoTrainer,
+    NeMoSampler,
+    Trainer,  # Type alias for backward compatibility
+    Sampler,  # Type alias for backward compatibility
+)
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
@@ -42,8 +58,8 @@ TokenizerType = PreTrainedTokenizerBase
 
 
 def grpo_train_refactored(
-    trainer: Trainer,
-    sampler: Sampler,
+    trainer: TrainerInterface,
+    sampler: SamplerInterface,
     dataloader,
     val_dataloader: Optional,
     tokenizer: TokenizerType,
@@ -62,8 +78,8 @@ def grpo_train_refactored(
     making the code more modular and easier to understand.
 
     Args:
-        trainer: Trainer instance (created via create_trainer)
-        sampler: Sampler instance (created via create_sampler)
+        trainer: TrainerInterface instance (e.g., NeMoTrainer, MockTrainer, TinkerTrainer)
+        sampler: SamplerInterface instance (e.g., NeMoSampler, MockSampler, TinkerSampler)
         dataloader: Training data loader
         val_dataloader: Optional validation data loader
         tokenizer: Tokenizer
@@ -109,7 +125,15 @@ def grpo_train_refactored(
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
         if sampler_stale:
-            sampler.weight_sync(kv_scales=kv_scales_cache, timer=timer)
+            # Sync weights using interface-compatible method
+            if hasattr(sampler, "weight_sync"):
+                # NeMoSampler has weight_sync() for backward compatibility
+                sampler.weight_sync(kv_scales=kv_scales_cache, timer=timer)  # type: ignore
+            elif hasattr(sampler, "_trainer") and sampler._trainer is not None:
+                # For Mock/Tinker samplers, use trainer's save_weights_and_get_sampling_client
+                sampler._trainer.save_weights_and_get_sampling_client(
+                    kv_scales=kv_scales_cache, timer=timer
+                )
             sampler_stale = False
         val_metrics, validation_timings = validate(
             sampler.generation,
@@ -186,7 +210,15 @@ def grpo_train_refactored(
                                 calibration_data, include_q=True
                             )["layers"]
 
-                        sampler.weight_sync(kv_scales=kv_scales_cache, timer=timer)
+                        # Sync weights using interface-compatible method
+                        if hasattr(sampler, "weight_sync"):
+                            # NeMoSampler has weight_sync() for backward compatibility
+                            sampler.weight_sync(kv_scales=kv_scales_cache, timer=timer)  # type: ignore
+                        elif hasattr(sampler, "_trainer") and sampler._trainer is not None:
+                            # For Mock/Tinker samplers, use trainer's save_weights_and_get_sampling_client
+                            sampler._trainer.save_weights_and_get_sampling_client(
+                                kv_scales=kv_scales_cache, timer=timer
+                            )
                         sampler_stale = False
 
                 dynamic_sampling_num_gen_batches += 1
@@ -203,7 +235,8 @@ def grpo_train_refactored(
                     )
                     generation_input.to("cpu")
 
-                    # Use sampler.stream() for generation
+                    # Use sampler's generation interface for rollout
+                    # Note: run_multi_turn_rollout uses sampler.generation directly
                     repeated_batch, rollout_metrics = run_multi_turn_rollout(
                         sampler.generation,  # Pass generation interface directly
                         input_batch=repeated_batch,
@@ -330,10 +363,11 @@ def grpo_train_refactored(
                 # Train using the trainer interface
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
+                    # Use new interface signature: forward_backward(data, loss_fn, datastream_id=None)
                     train_results = trainer.forward_backward(
-                        datastream_id=f"step_{current_step}",
-                        loss_fn=loss_fn,
                         data=train_data,
+                        loss_fn=loss_fn,
+                        datastream_id=f"step_{current_step}",
                     )
                     sampler_stale = True  # Mark sampler as needing weight sync
 
@@ -352,7 +386,15 @@ def grpo_train_refactored(
                 # Validation
                 if val_period > 0 and (total_steps + 1) % val_period == 0:
                     if sampler_stale:
-                        sampler.weight_sync(kv_scales=kv_scales_cache, timer=timer)
+                        # Sync weights using interface-compatible method
+                        if hasattr(sampler, "weight_sync"):
+                            # NeMoSampler has weight_sync() for backward compatibility
+                            sampler.weight_sync(kv_scales=kv_scales_cache, timer=timer)  # type: ignore
+                        elif hasattr(sampler, "_trainer") and sampler._trainer is not None:
+                            # For Mock/Tinker samplers, use trainer's save_weights_and_get_sampling_client
+                            sampler._trainer.save_weights_and_get_sampling_client(
+                                kv_scales=kv_scales_cache, timer=timer
+                            )
                         sampler_stale = False
                     val_metrics, validation_timings = validate(
                         sampler.generation,
